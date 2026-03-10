@@ -1,8 +1,27 @@
 """LLM-callable tools for the voice agent orchestration."""
 import asyncio
+from uuid import UUID
 from db import get_supabase
 from datetime import datetime, timedelta
 import config
+
+
+WEEKDAY_MAP = {
+    "monday": 0,
+    "mon": 0,
+    "tuesday": 1,
+    "tue": 1,
+    "wednesday": 2,
+    "wed": 2,
+    "thursday": 3,
+    "thu": 3,
+    "friday": 4,
+    "fri": 4,
+    "saturday": 5,
+    "sat": 5,
+    "sunday": 6,
+    "sun": 6,
+}
 
 
 def get_customer_profile(customer_id: str) -> dict | None:
@@ -72,13 +91,102 @@ def get_available_banker_slots(date_str: str | None = None) -> list[dict]:
 def hold_slot(slot_id: str, slot_type: str) -> dict:
     sb = get_supabase()
     status = "primary_selected" if slot_type == "primary" else "fallback_selected"
-    res = (
-        sb.table("banker_availability")
-        .update({"status": status})
-        .eq("id", slot_id)
-        .execute()
-    )
-    return res.data[0] if res.data else {}
+    try:
+        res = (
+            sb.table("banker_availability")
+            .update({"status": status})
+            .eq("id", slot_id)
+            .execute()
+        )
+        return res.data[0] if res.data else {}
+    except Exception as e:
+        print(f"[BOOKING] Failed to hold slot '{slot_id}' ({slot_type}): {e}")
+        return {}
+
+
+def _is_uuid(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        UUID(str(value))
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_slot_id(slot_hint: str | None, available_slots: list[dict], used_ids: set[str]) -> str | None:
+    """Resolve model-provided slot hints to a real slot UUID.
+
+    The LLM sometimes emits human-friendly labels like `8-9_am` instead of UUIDs.
+    """
+    if not slot_hint:
+        return None
+
+    hint = str(slot_hint).strip()
+
+    # Use direct UUID when it matches an available slot.
+    if _is_uuid(hint):
+        for slot in available_slots:
+            if slot.get("id") == hint and hint not in used_ids:
+                return hint
+
+    hint_norm = hint.lower().replace("_", " ").replace("-", " ")
+
+    # Try matching by slot label text first.
+    for slot in available_slots:
+        sid = slot.get("id")
+        label = str(slot.get("slot_label", "")).lower()
+        if not sid or sid in used_ids:
+            continue
+        if label and (hint_norm in label or label in hint_norm):
+            return sid
+
+    # Time phrase fallback mapping for common demo utterances.
+    preferred_tokens = []
+    if ("8" in hint_norm and "9" in hint_norm) or "morning" in hint_norm:
+        preferred_tokens = ["8:00", "8 to 9", "8-9"]
+    elif ("12" in hint_norm and "1" in hint_norm) or "lunch" in hint_norm or "midday" in hint_norm:
+        preferred_tokens = ["12:00", "12 to 1", "12-1"]
+    elif ("3" in hint_norm and "4" in hint_norm) or "afternoon" in hint_norm:
+        preferred_tokens = ["15:00", "3:00", "3 to 4", "3-4"]
+
+    if preferred_tokens:
+        for slot in available_slots:
+            sid = slot.get("id")
+            label = str(slot.get("slot_label", "")).lower()
+            if not sid or sid in used_ids:
+                continue
+            if any(tok in label for tok in preferred_tokens):
+                return sid
+
+    # Final fallback: first available slot not already used.
+    for slot in available_slots:
+        sid = slot.get("id")
+        if sid and sid not in used_ids:
+            return sid
+
+    return None
+
+
+def _extract_requested_weekday(conversation_text: str | None) -> int | None:
+    if not conversation_text:
+        return None
+    text = conversation_text.lower()
+    for token, day_num in WEEKDAY_MAP.items():
+        if token in text:
+            return day_num
+    return None
+
+
+def _slot_weekday(slot: dict) -> int | None:
+    starts_at = slot.get("starts_at")
+    if not starts_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(starts_at).replace("Z", "+00:00"))
+        return dt.weekday()
+    except Exception:
+        return None
 
 
 def create_appointment(data: dict) -> dict:
@@ -255,14 +363,27 @@ def create_appointment_from_call(
     collected_data: list[dict] | None = None,
     primary_slot_id: str | None = None,
     fallback_slot_id: str | None = None,
+    conversation_text: str | None = None,
 ) -> dict:
     """Create an appointment from a live call. Status = Pending until banker accepts."""
     sb = get_supabase()
 
+    normalized_intent = (intent or "").strip() or "Home Loan Enquiry"
+    normalized_location_type = (location_type or "Phone").strip()
+    if normalized_location_type.lower() == "video chat":
+        normalized_location_type = "Video chat"
+    normalized_ai_note = (ai_note or "").strip()
+
     # Get customer profile for denormalized fields
     profile = get_customer_profile(customer_id)
     if not profile:
-        return {"status": "error", "error": "customer not found"}
+        fallback = sb.table("customer_profiles").select("*").limit(1).execute()
+        if fallback.data:
+            profile = fallback.data[0]
+            customer_id = profile["id"]
+            print(f"[BOOKING] customer_id not found, using fallback customer_id={customer_id}")
+        else:
+            return {"status": "error", "error": "customer not found"}
 
     # Get banker (Rob)
     banker_id = "b0000001-0000-0000-0000-000000000001"
@@ -271,10 +392,10 @@ def create_appointment_from_call(
         "customer_id": customer_id,
         "session_id": session_id,
         "banker_id": banker_id,
-        "appointment_type": intent,
-        "location_type": location_type,
-        "intent": intent,
-        "ai_note": ai_note,
+        "appointment_type": normalized_intent,
+        "location_type": normalized_location_type,
+        "intent": normalized_intent,
+        "ai_note": normalized_ai_note,
         "status": "Pending",
         "customer_name": profile["full_name"],
         "customer_initials": profile.get("initials", ""),
@@ -286,12 +407,28 @@ def create_appointment_from_call(
         "collected_data_json": collected_data or [],
     }
 
-    if primary_slot_id:
-        apt_data["preferred_slot_id"] = primary_slot_id
-        hold_slot(primary_slot_id, "primary")
-    if fallback_slot_id:
-        apt_data["fallback_slot_id"] = fallback_slot_id
-        hold_slot(fallback_slot_id, "fallback")
+    # Resolve model-provided slot hints to valid UUIDs before DB writes.
+    available_slots = get_available_banker_slots()
+    requested_weekday = _extract_requested_weekday(conversation_text)
+    if requested_weekday is not None and available_slots:
+        available_slots = sorted(
+            available_slots,
+            key=lambda s: (0 if _slot_weekday(s) == requested_weekday else 1, s.get("starts_at", "")),
+        )
+
+    used_slot_ids: set[str] = set()
+
+    resolved_primary = _resolve_slot_id(primary_slot_id, available_slots, used_slot_ids)
+    if resolved_primary:
+        apt_data["preferred_slot_id"] = resolved_primary
+        hold_slot(resolved_primary, "primary")
+        used_slot_ids.add(resolved_primary)
+
+    resolved_fallback = _resolve_slot_id(fallback_slot_id, available_slots, used_slot_ids)
+    if resolved_fallback and resolved_fallback != resolved_primary:
+        apt_data["fallback_slot_id"] = resolved_fallback
+        hold_slot(resolved_fallback, "fallback")
+        used_slot_ids.add(resolved_fallback)
 
     res = sb.table("appointments").insert(apt_data).execute()
     if res.data:

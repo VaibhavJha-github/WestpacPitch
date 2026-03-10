@@ -233,6 +233,11 @@ Available tools:
 - route_to_team: args {{intent, emotion}} — route to specialist team
 - send_followup_sms: args {{customer_id, message}} — send follow-up text message
 
+BOOKING INTEGRITY RULE (MANDATORY):
+- Never say a meeting is booked/confirmed unless you first emit a valid `create_appointment_offer` tool call.
+- If the customer asks to book, emit the tool call first, then confirm booking in natural language.
+- If tool call is not possible yet, ask for missing booking details instead of claiming success.
+
 Only call tools when you genuinely need data. For Rohan's spending data, you already have it in context — no need to call tools for that.
 
 THINGS YOU MUST NEVER DO:
@@ -259,16 +264,23 @@ CURRENT CUSTOMER CONTEXT:
 
 SUMMARY_PROMPT = """You are an AI analyst reviewing a completed customer service call for Westpac Bank. Analyze the transcript and produce a structured JSON summary that will help a banker prepare for a follow-up appointment.
 
+Focus on the customer's situation, goals, constraints, financial context, and what the banker should know before the meeting.
+Do not describe the fact that an appointment was booked unless that is essential context.
+Do not mention internal workflow steps, system actions, or that the AI arranged a meeting.
+Infer the most likely primary intent even if the transcript does not say it verbatim.
+Extract concrete facts from the transcript into collected_data whenever possible.
+If the customer asked for an online or video meeting, reflect that in the facts you extract.
+
 Return ONLY valid JSON with these fields:
 {{
-  "short_summary": "1-2 sentence summary of the call",
-  "long_summary": "3-4 sentence detailed summary including customer situation, needs, and any concerns",
-  "primary_intent": "the main reason the customer called (e.g., 'Budget Planning - Car Savings', 'Home Loan Enquiry', 'First Home Purchase')",
+  "short_summary": "1-2 sentence banker-facing summary of the customer's situation and why they need follow-up",
+  "long_summary": "3-4 sentence detailed banker-facing summary including customer situation, needs, timeline, preferences, and any concerns",
+  "primary_intent": "specific main reason the customer called (e.g., 'First Home Purchase', 'Home Loan Enquiry', 'Refinance - Fixed Rate Expiry')",
   "routed_team": "which team should handle this: 'Home Loans / Mortgages', 'Cards & Payments', 'Transactions & Accounts', 'Digital Banking Support', 'Security Specialist Team', 'Personal Loans', 'Financial Hardship', or 'Disputes / Chargebacks'",
   "recommended_strategy_title": "short 3-6 word strategy title for the banker (e.g., 'Budget Optimisation + Car Goal')",
   "recommended_strategy_description": "2-3 sentence actionable strategy for the banker meeting. What should they lead with? What should they prepare? What's the customer's hot button?",
   "collected_data": [
-    {{"label": "field name", "value": "what the customer said"}}
+    {{"label": "field name", "value": "concrete fact stated or strongly implied in the transcript"}}
   ],
   "sentiment_label": "Positive, Neutral, Anxious, or Frustrated",
   "sentiment_note": "brief note explaining the customer's emotional state and any triggers",

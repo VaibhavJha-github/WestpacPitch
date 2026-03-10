@@ -1,108 +1,94 @@
-# RunPod Serverless vLLM Setup
+# RunPod Setup Notes
 
-No custom Docker image needed. RunPod has an official vLLM worker.
+RunPod is optional in the current repository.
 
-## Steps
+## Current status
 
-### 1. Go to RunPod Serverless
-- Log in at https://www.runpod.io/console/serverless
-- Click **New Endpoint**
+- The codebase still supports RunPod-related environment variables in `backend/config.py`.
+- The current primary live response path is Groq first, then OpenAI fallback.
+- RunPod is not the main active provider in the current live turn-processing path.
 
-### 2. Select the vLLM Worker
-- Under "Quick Deploy", find **vLLM** (or search for it)
-- Or use the worker image: `runpod/worker-vllm:stable-cuda12.1.0`
+That means you do not need RunPod to run the current demo locally.
 
-### 3. Configure the Endpoint
+Use RunPod only if you want to prepare an alternate hosted OpenAI-compatible endpoint for future experimentation or to reintroduce a custom vLLM path.
 
-**GPU Selection:**
-- Select **A40 48GB** or **A6000 48GB**
-- Either works for Qwen2.5-14B-AWQ (needs ~10GB VRAM, plenty of headroom)
+---
 
-**Worker Configuration:**
-- Active Workers: `0` (scales to zero when idle)
-- Max Workers: `1` (single demo caller)
-- Idle Timeout: `5 minutes` (keeps warm after last request)
-- Execution Timeout: `300 seconds`
+## Environment Variables
 
-**Environment Variables:**
+These are the RunPod-related variables currently recognized by the backend:
+
+```env
+RUNPOD_API_KEY=
+RUNPOD_ENDPOINT_ID=
+VLLM_BASE_URL=
+VLLM_MODEL=Qwen/Qwen2.5-14B-Instruct-AWQ
 ```
+
+If `VLLM_BASE_URL` is not set but `RUNPOD_ENDPOINT_ID` is set, the backend constructs:
+
+```text
+https://api.runpod.ai/v2/<RUNPOD_ENDPOINT_ID>/openai/v1
+```
+
+---
+
+## Suggested RunPod Configuration
+
+If you still want a compatible endpoint ready:
+
+### Model
+
+- `Qwen/Qwen2.5-14B-Instruct-AWQ`
+
+### Worker shape
+
+- A40 48GB or A6000 48GB
+- max workers: 1
+- active workers: 0 for cost savings, 1 if you want reduced cold starts
+
+### Typical environment values
+
+```env
 MODEL_NAME=Qwen/Qwen2.5-14B-Instruct-AWQ
 MAX_MODEL_LEN=8192
 GPU_MEMORY_UTILIZATION=0.90
 DTYPE=half
 QUANTIZATION=awq
 DISABLE_LOG_STATS=true
-```
-
-**Advanced (optional but recommended):**
-```
 TOKENIZER_MODE=auto
 MAX_NUM_SEQS=1
 ```
 
-### 4. Create the Endpoint
-- Click **Create**
-- Wait for it to build (first time takes a few minutes)
-- Note the **Endpoint ID** (looks like `abc123def456`)
+---
 
-### 5. Update Your Backend .env
+## How To Test It Independently
 
-Add this line to `/Users/vaibhavjha/Documents/WestpacChatbot/backend/.env`:
-```
-RUNPOD_ENDPOINT_ID=<your-endpoint-id-here>
-```
+If you provision a RunPod OpenAI-compatible endpoint, test it directly with a simple chat completion request before wiring anything else around it.
 
-The backend will automatically construct the URL:
-`https://api.runpod.ai/v2/<endpoint-id>/openai/v1`
+Example shape:
 
-### 6. Test It
-
-Restart the backend:
-```bash
-cd /Users/vaibhavjha/Documents/WestpacChatbot/backend
-source venv/bin/activate
-python main.py
-```
-
-Then warmup:
-```bash
-curl -X POST http://localhost:8000/api/warmup
-```
-
-Or use the **Warm Up** button on the Live page at http://localhost:5173/live
-
-First warmup will be slow (30-60s) as the model loads. Subsequent calls will be fast (~300-900ms).
-
-### 7. Test Directly (Optional)
-
-You can test the RunPod endpoint directly:
 ```bash
 curl https://api.runpod.ai/v2/<endpoint-id>/openai/v1/chat/completions \
-  -H "Authorization: Bearer <YOUR_RUNPOD_API_KEY>" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-14B-Instruct-AWQ",
-    "messages": [{"role": "user", "content": "Say hello"}],
+    "messages": [{"role": "user", "content": "Say hello in one word."}],
     "max_tokens": 20
   }'
 ```
 
-## Cost Estimate
+---
 
-- A40: ~$0.39/hr active, $0 idle (with scale-to-zero)
-- A6000: ~$0.39/hr active, $0 idle
-- For a 1-hour demo session: ~$0.40-0.80
-- FlashBoot (if available): reduces cold start to ~10-15s
+## Recommendation
 
-## Troubleshooting
+For the current demo architecture, prioritize:
 
-**Cold start too slow?**
-- Set Active Workers to `1` before the demo (costs money while idle but instant response)
-- Or hit Warm Up 2 minutes before demo
+1. Groq credentials
+2. OpenAI credentials
+3. Anthropic credentials
+4. ElevenLabs credentials
+5. Twilio credentials
 
-**Out of memory?**
-- Shouldn't happen with AWQ on 48GB, but try setting `GPU_MEMORY_UTILIZATION=0.85`
-
-**Model download slow on first deploy?**
-- First deploy downloads ~8GB model. Subsequent starts use cached model.
-- Enable FlashBoot for faster cold starts if available.
+Treat RunPod as optional infrastructure, not a required part of the current setup.

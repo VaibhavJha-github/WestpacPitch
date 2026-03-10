@@ -22,20 +22,17 @@ from fastapi import WebSocket
 from starlette.responses import Response
 
 import config
+from db import get_supabase
 from config import ELEVENLABS_API_KEY
-from stt import transcribe_audio, detected_language_to_code
 from tts import synthesize_speech, get_voice_id
-from llm import generate_response, generate_summary
-from sentiment import analyze_sentiment
+from session_flow import SessionFlow
 from tools import (
-    get_customer_profile, get_customer_accounts, get_spending_summary,
-    search_knowledge_pack, get_available_banker_slots, hold_slot,
-    create_appointment, create_appointment_from_call, route_to_team,
-    save_call_session, update_call_session, save_call_turn, update_analytics,
-    send_sms,
+    update_call_session,
 )
-from sentiment import aggregate_sentiment
 from prompts import VOICE_AGENT_SYSTEM_PROMPT
+
+
+TWILIO_DEFAULT_VOICE_ID = "snyKKuaGYk1VUEh42zbW"
 
 
 def twiml_connect_stream(ws_url: str) -> str:
@@ -52,8 +49,13 @@ def twiml_connect_stream(ws_url: str) -> str:
 
 def voice_webhook_handler(host: str, scheme: str = "wss") -> Response:
     """Handle incoming Twilio voice call — return TwiML to start Media Stream."""
+    print("[voice_webhook_handler] CALLED")
+    print(f"[voice_webhook_handler] host={host}, scheme={scheme}")
     ws_url = f"{scheme}://{host}/api/twilio/stream"
+    print(f"[voice_webhook_handler] ws_url={ws_url}")
     twiml = twiml_connect_stream(ws_url)
+    print(f"[voice_webhook_handler] returning TwiML")
+    print(f"[voice_webhook_handler] TwiML content:\n{twiml}")
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -112,10 +114,18 @@ def mp3_to_mulaw(mp3_bytes: bytes) -> bytes:
     wav_path = mp3_path.replace('.mp3', '.wav')
 
     try:
-        subprocess.run([
+        print(f"[mp3_to_mulaw] Converting {mp3_path} to {wav_path}")
+        result = subprocess.run([
             'ffmpeg', '-y', '-i', mp3_path,
             '-ar', '8000', '-ac', '1', '-f', 'wav', wav_path
-        ], capture_output=True, check=True)
+        ], capture_output=True, check=False)
+        
+        if result.returncode != 0:
+            print(f"[mp3_to_mulaw] ffmpeg error code: {result.returncode}")
+            print(f"[mp3_to_mulaw] stderr: {result.stderr.decode()}")
+            raise Exception(f"ffmpeg failed with code {result.returncode}: {result.stderr.decode()}")
+        
+        print(f"[mp3_to_mulaw] ffmpeg conversion successful")
 
         with open(wav_path, 'rb') as f:
             wav_data = f.read()
@@ -123,6 +133,9 @@ def mp3_to_mulaw(mp3_bytes: bytes) -> bytes:
         # Skip WAV header, convert PCM to mulaw
         pcm = wav_data[44:]
         return audioop.lin2ulaw(pcm, 2)
+    except FileNotFoundError as e:
+        print(f"[mp3_to_mulaw] FileNotFoundError: {e}")
+        raise
     finally:
         os.unlink(mp3_path)
         if os.path.exists(wav_path):
@@ -135,167 +148,56 @@ async def handle_twilio_stream(ws: WebSocket):
     Twilio sends JSON messages with audio chunks (base64 mulaw).
     We accumulate audio, run VAD, then process through our pipeline.
     """
-    await ws.accept()
+    print("[Twilio Stream] WebSocket connection attempt")
+    try:
+        await ws.accept()
+        print("[Twilio Stream] WebSocket accepted successfully")
+    except Exception as e:
+        print(f"[Twilio Stream] ERROR accepting WebSocket: {e}")
+        return
 
     stream_sid = None
     call_sid = None
-    customer_id = "c0000001-0000-0000-0000-000000000001"
-    session_id = str(uuid4())
+    flow = SessionFlow()
 
     # Audio buffer for incoming mulaw
     audio_buffer = bytearray()
-    silence_frames = 0
     speech_started = False
-    SILENCE_THRESHOLD = 50  # mulaw energy threshold
-    SILENCE_FRAMES_NEEDED = 40  # ~2 seconds at 50 packets/sec
-    MIN_AUDIO_SIZE = 4000  # minimum audio to process
+    speech_start_time = None
+    silence_start_time = None
+    listening_enabled = False
+    response_in_flight = False
+    resume_listening_at = 0.0
+    media_packets = 0
 
-    # Conversation state
-    messages = []
-    turn_index = 0
-    all_turns = []
-    voice_override = None
-    booking_created = False  # Track if a booking was made during the call
-
-    # Create session
-    save_call_session({
-        "id": session_id,
-        "customer_id": customer_id,
-        "session_status": "active",
-    })
-
-    # Load customer context
-    profile = get_customer_profile(customer_id)
-    accounts = get_customer_accounts(customer_id)
-    context_parts = []
-    if profile:
-        context_parts.append(f"Customer: {profile['full_name']}, Age: {profile.get('age')}, Location: {profile.get('location')}, Profession: {profile.get('profession')}, Tenure: {profile.get('tenure_label')}")
-    if accounts:
-        acct_summary = ", ".join(f"{a['nickname']}: ${a['balance']}" for a in accounts)
-        context_parts.append(f"Accounts: {acct_summary}")
-    context = "\n".join(context_parts)
+    voice_override = TWILIO_DEFAULT_VOICE_ID
+    started = None
 
     async def process_audio(audio_mulaw: bytes):
-        """Process accumulated audio through STT → LLM → TTS pipeline."""
-        nonlocal turn_index, messages, all_turns
+        """Process accumulated audio through the shared session flow."""
+        nonlocal listening_enabled, response_in_flight, resume_listening_at
 
-        # Convert mulaw to WAV for Whisper
-        wav_bytes = mulaw_to_wav(audio_mulaw)
-
-        # STT
-        stt_result = transcribe_audio(wav_bytes)
-        customer_text = stt_result["text"].strip()
-        if not customer_text:
+        if not started:
+            return
+        if response_in_flight:
+            print("[TWILIO] Skipping utterance because a response is already in flight")
             return
 
-        detected_lang = detected_language_to_code(stt_result["language"])
-        print(f"[TWILIO] Customer: {customer_text} (lang={detected_lang})")
+        response_in_flight = True
 
-        turn_index += 1
-        save_call_turn({
-            "session_id": session_id,
-            "speaker": "customer",
-            "text": customer_text,
-            "timestamp_label": datetime.utcnow().strftime("%H:%M"),
-            "language_code": detected_lang,
-            "turn_index": turn_index,
-            "stt_latency_ms": stt_result["latency_ms"],
-        })
-        all_turns.append({"speaker": "customer", "text": customer_text})
-        messages.append({"role": "user", "content": customer_text})
-
-        # Build context
-        extra_context = context
-        for kw in ["rate", "loan", "product", "home loan", "fixed", "variable", "first home", "fraud", "scam", "lost card"]:
-            if kw in customer_text.lower():
-                knowledge = search_knowledge_pack(kw)
-                if knowledge:
-                    extra_context += "\n\nRelevant Knowledge:\n" + "\n---\n".join(
-                        f"{k['title']}: {k['content'][:500]}" for k in knowledge
-                    )
-                break
-
-        for kw in ["spend", "saving", "budget", "afford", "money", "car", "goal"]:
-            if kw in customer_text.lower():
-                spending = get_spending_summary(customer_id)
-                if spending:
-                    extra_context += "\n\nSpending Summary:\n" + "\n".join(
-                        f"- {s['category']}: ${s['total_amount']} ({s['transaction_count']} txns)"
-                        for s in spending
-                    )
-                break
-
-        # LLM
-        llm_result = await generate_response(messages, context=extra_context)
-        bot_text = llm_result["text"]
-
-        # Handle tool calls (same as main.py)
-        if llm_result.get("tool_call"):
-            tc = llm_result["tool_call"]
-            tool_name = tc.get("tool", "")
-            tool_args = tc.get("args", {})
-
-            if tool_name == "get_available_banker_slots":
-                tool_result = get_available_banker_slots(tool_args.get("date"))
-                if tool_result:
-                    slots_text = "\n".join(f"- {s['slot_label']} ({s['status']})" for s in tool_result[:5])
-                    messages.append({"role": "assistant", "content": bot_text or "Let me check available slots."})
-                    messages.append({"role": "user", "content": f"[Tool result - available slots:\n{slots_text}]\nNow offer the customer 2 suitable slots."})
-                    followup = await generate_response(messages, context=extra_context)
-                    bot_text = followup["text"]
-
-            elif tool_name == "search_knowledge_pack":
-                tool_result = search_knowledge_pack(tool_args.get("query", ""))
-                if tool_result:
-                    knowledge_text = "\n---\n".join(f"{k['title']}: {k['content'][:400]}" for k in tool_result)
-                    messages.append({"role": "assistant", "content": bot_text or "Let me look that up."})
-                    messages.append({"role": "user", "content": f"[Knowledge result:\n{knowledge_text}]\nAnswer using this."})
-                    followup = await generate_response(messages, context=extra_context)
-                    bot_text = followup["text"]
-
-            elif tool_name == "get_spending_summary":
-                tool_result = get_spending_summary(tool_args.get("customer_id", customer_id))
-                if tool_result:
-                    spending_text = "\n".join(f"- {s['category']}: ${s['total_amount']}" for s in tool_result)
-                    messages.append({"role": "assistant", "content": bot_text or "Let me review your spending."})
-                    messages.append({"role": "user", "content": f"[Spending data:\n{spending_text}]\nProvide helpful insights."})
-                    followup = await generate_response(messages, context=extra_context)
-                    bot_text = followup["text"]
-
-            elif tool_name == "create_appointment_offer":
-                nonlocal booking_created
-                apt = create_appointment_from_call(
-                    session_id=session_id,
-                    customer_id=customer_id,
-                    intent=tool_args.get("intent", "Home Loan Enquiry"),
-                    location_type=tool_args.get("location_type", "Phone"),
-                    ai_note=tool_args.get("ai_note", ""),
-                    collected_data=tool_args.get("collected_data"),
-                    primary_slot_id=tool_args.get("primary_slot_id"),
-                    fallback_slot_id=tool_args.get("fallback_slot_id"),
-                )
-                booking_created = True
-                if not bot_text:
-                    bot_text = "I've noted your booking. Rob will confirm shortly and you'll get a text with the details."
-
-            elif tool_name == "send_followup_sms":
-                sms_body = tool_args.get("message", "")
-                if sms_body and config.CUSTOMER_PHONE_NUMBER:
-                    send_sms(config.CUSTOMER_PHONE_NUMBER, sms_body)
-
-            elif tool_name == "route_to_team":
-                team = route_to_team(tool_args.get("intent", ""), tool_args.get("emotion"))
-                update_call_session(session_id, {"routed_team": team})
-
-        if not bot_text:
-            bot_text = "I understand. How can I help you further?"
-
-        messages.append({"role": "assistant", "content": bot_text})
-        print(f"[TWILIO] Bot: {bot_text}")
-
-        # TTS
         try:
-            tts_audio = await synthesize_speech(bot_text, voice_override, detected_lang)
+            wav_bytes = mulaw_to_wav(audio_mulaw)
+            turn_result = await flow.process_audio(wav_bytes, filename="audio.wav")
+            if not turn_result:
+                return
+
+            print(f"[TWILIO] Customer: {turn_result['customer_text']}")
+            print(f"[TWILIO] Bot: {turn_result['bot_text']}")
+
+            listening_enabled = False
+            audio_buffer.clear()
+
+            tts_audio = await synthesize_speech(turn_result["bot_text"], voice_override, turn_result["language"])
             mulaw_audio = mp3_to_mulaw(tts_audio)
 
             # Send audio back to Twilio in chunks
@@ -312,18 +214,11 @@ async def handle_twilio_stream(ws: WebSocket):
 
         except Exception as e:
             print(f"[TWILIO TTS ERROR] {e}")
-
-        turn_index += 1
-        save_call_turn({
-            "session_id": session_id,
-            "speaker": "bot",
-            "text": bot_text,
-            "timestamp_label": datetime.utcnow().strftime("%H:%M"),
-            "language_code": detected_lang,
-            "turn_index": turn_index,
-            "llm_latency_ms": llm_result["latency_ms"],
-        })
-        all_turns.append({"speaker": "bot", "text": bot_text})
+        finally:
+            audio_buffer.clear()
+            listening_enabled = True
+            resume_listening_at = time.time() + 0.35
+            response_in_flight = False
 
     try:
         async for message in ws.iter_text():
@@ -339,23 +234,19 @@ async def handle_twilio_stream(ws: WebSocket):
                 # Check for custom parameters
                 params = data["start"].get("customParameters", {})
                 if params.get("customer_id"):
-                    customer_id = params["customer_id"]
+                    flow.customer_id = params["customer_id"]
                 print(f"[TWILIO] Stream started: {stream_sid}, call: {call_sid}")
+                print("[Twilio Stream] Creating shared session...")
 
-                # AI greets first
-                customer_name = profile["full_name"].split()[0] if profile else "mate"
-                greeting = f"G'day {customer_name}, thanks for calling Westpac! I'm Alex, your AI assistant. Just letting you know this call is being recorded for quality purposes. How can I help you today?"
-                messages.append({"role": "assistant", "content": greeting})
-                all_turns.append({"speaker": "bot", "text": greeting})
-                turn_index += 1
-                save_call_turn({
-                    "session_id": session_id,
-                    "speaker": "bot",
-                    "text": greeting,
-                    "timestamp_label": datetime.utcnow().strftime("%H:%M"),
-                    "language_code": "en",
-                    "turn_index": turn_index,
-                })
+                try:
+                    started = await flow.start()
+                    print(f"[Twilio Stream] Session created: {started['session_id']}")
+                except Exception as e:
+                    print(f"[Twilio Stream] ERROR creating session: {e}")
+                    await ws.close()
+                    return
+
+                greeting = started["greeting"]
 
                 # TTS greeting
                 try:
@@ -371,94 +262,110 @@ async def handle_twilio_stream(ws: WebSocket):
                             "media": {"payload": payload_b64}
                         })
                         await asyncio.sleep(0.02)
+                    listening_enabled = True
+                    audio_buffer.clear()
+                    speech_started = False
+                    speech_start_time = None
+                    silence_start_time = None
+                    resume_listening_at = time.time() + 0.35
+                    media_packets = 0
+                    print("[TWILIO] Greeting playback finished; inbound speech detection enabled")
                 except Exception as e:
                     print(f"[TWILIO] Greeting TTS error: {e}")
 
             elif event == "media":
+                media_packets += 1
+                media = data.get("media", {})
+                track = media.get("track", "unknown")
+                now = time.time()
+
+                if not listening_enabled:
+                    if media_packets % 50 == 0:
+                        print(f"[TWILIO MEDIA] Ignoring media until greeting finishes; packets={media_packets}, track={track}")
+                    continue
+
+                if response_in_flight or now < resume_listening_at:
+                    if speech_started:
+                        speech_started = False
+                        speech_start_time = None
+                        silence_start_time = None
+                        audio_buffer.clear()
+                    continue
+
+                if track not in ("inbound", "inbound_track", "unknown"):
+                    if media_packets % 50 == 0:
+                        print(f"[TWILIO MEDIA] Ignoring non-inbound track={track}; packets={media_packets}")
+                    continue
+
                 # Incoming audio chunk (base64 mulaw)
-                payload = data["media"]["payload"]
+                payload = media["payload"]
                 chunk = base64.b64decode(payload)
-                audio_buffer.extend(chunk)
+                pcm_chunk = audioop.ulaw2lin(chunk, 2)
+                rms = (audioop.rms(pcm_chunk, 2) / 32768.0) if pcm_chunk else 0.0
 
-                # Simple energy-based VAD
-                energy = sum(abs(b - 128) for b in chunk) / len(chunk) if chunk else 0
+                if media_packets % 50 == 0:
+                    print(
+                        f"[TWILIO MEDIA] packets={media_packets} track={track} rms={rms:.4f} "
+                        f"speech_started={speech_started} buffer={len(audio_buffer)}"
+                    )
 
-                if energy > SILENCE_THRESHOLD:
-                    speech_started = True
-                    silence_frames = 0
+                speech_threshold = 0.025  # Same as Live dashboard
+
+                if rms > speech_threshold:
+                    if not speech_started:
+                        audio_buffer.clear()
+                        speech_started = True
+                        speech_start_time = now
+                        print(f"[TWILIO VAD] Speech started; rms={rms:.4f}")
+                    audio_buffer.extend(chunk)
+                    silence_start_time = None
                 elif speech_started:
-                    silence_frames += 1
-                    if silence_frames >= SILENCE_FRAMES_NEEDED and len(audio_buffer) > MIN_AUDIO_SIZE:
-                        # End of utterance
-                        audio_data = bytes(audio_buffer)
+                    audio_buffer.extend(chunk)
+                    if silence_start_time is None:
+                        silence_start_time = now
+                        print(f"[TWILIO VAD] Silence started; rms={rms:.4f}")
+                    elif (now - silence_start_time) > 1.8:
+                        duration = (now - speech_start_time) if speech_start_time else 0.0
+                        if duration > 0.5 and len(audio_buffer) > 4000:
+                            audio_data = bytes(audio_buffer)
+                            print(
+                                f"[TWILIO VAD] Utterance complete; duration={duration:.2f}s, "
+                                f"bytes={len(audio_data)}"
+                            )
+                            asyncio.create_task(process_audio(audio_data))
+                        else:
+                            print(
+                                f"[TWILIO VAD] Discarded short utterance; duration={duration:.2f}s, "
+                                f"bytes={len(audio_buffer)}"
+                            )
+
                         audio_buffer.clear()
                         speech_started = False
-                        silence_frames = 0
-
-                        # Process in background so we don't block the stream
-                        asyncio.create_task(process_audio(audio_data))
+                        speech_start_time = None
+                        silence_start_time = None
 
             elif event == "stop":
                 print(f"[TWILIO] Stream stopped")
                 break
 
+    except RuntimeError as e:
+        if "WebSocket is not connected" in str(e):
+            print("[TWILIO] WebSocket closed during reload/shutdown")
+        else:
+            print(f"[TWILIO WS EXCEPTION] RuntimeError: {e}")
+            import traceback
+            traceback.print_exc()
     except Exception as e:
-        print(f"[TWILIO] Error: {e}")
+        print(f"[TWILIO WS EXCEPTION] Error in stream handler: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # Post-call: sentiment + summary + update DB
-    if all_turns:
-        try:
-            print(f"[TWILIO POST-CALL] Processing {len(all_turns)} turns...")
-
-            # Sentiment
-            customer_texts = [t["text"] for t in all_turns if t["speaker"] == "customer"]
-            agg = aggregate_sentiment(
-                [{"speaker": "customer", "text": t} for t in customer_texts]
-            )
-
-            # Summary
-            summary = await generate_summary(all_turns)
-
-            update_call_session(session_id, {
-                "session_status": "completed",
-                "ended_at": datetime.utcnow().isoformat(),
-                "sentiment_label": agg["label"],
-                "sentiment_score": agg["score"],
-                "emotion_summary": agg["emotion"],
-                "primary_intent": summary.get("primary_intent", ""),
-                "routed_team": summary.get("routed_team", ""),
-                "ai_summary_short": summary.get("short_summary", ""),
-                "ai_summary_long": summary.get("long_summary", ""),
-                "recommended_strategy_title": summary.get("recommended_strategy_title", ""),
-                "recommended_strategy_description": summary.get("recommended_strategy_description", ""),
-                "booking_state": "pending_banker" if booking_created else "none",
+    try:
+        finalized = await flow.finalize()
+        if finalized:
+            update_call_session(finalized["session_id"], {
+                "booking_state": "pending_banker" if finalized["booking_created"] else "none",
             })
-
-            # Update appointment with summary data if booking was created
-            if booking_created:
-                sb = get_supabase()
-                apts = sb.table("appointments").select("id").eq("session_id", session_id).execute()
-                if apts.data:
-                    sb.table("appointments").update({
-                        "sentiment": agg["label"],
-                        "sentiment_score": agg["score"],
-                        "sentiment_note": agg["emotion"],
-                        "ai_note": summary.get("long_summary", ""),
-                        "recommended_strategy_title": summary.get("recommended_strategy_title", ""),
-                        "recommended_strategy_description": summary.get("recommended_strategy_description", ""),
-                    }).eq("id", apts.data[0]["id"]).execute()
-
-            # Update analytics
-            try:
-                update_analytics({
-                    "total_calls": 1,  # Will be incremented properly in production
-                    "completed_appointments": 1 if booking_created else 0,
-                })
-            except Exception:
-                pass
-
-            print(f"[TWILIO POST-CALL] Done. Sentiment: {agg['label']}, Intent: {summary.get('primary_intent')}")
-
-        except Exception as e:
-            print(f"[TWILIO] Post-call error: {e}")
-            import traceback; traceback.print_exc()
+    except Exception as e:
+        print(f"[TWILIO] Post-call error: {e}")
+        import traceback; traceback.print_exc()

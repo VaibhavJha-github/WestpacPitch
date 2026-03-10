@@ -33,6 +33,9 @@ async def synthesize_speech(
     language_code: str = "en",
 ) -> bytes:
     """Generate TTS audio. Uses OpenAI TTS for speed."""
+    if voice_override and ELEVENLABS_API_KEY:
+        return await _elevenlabs_tts(text, voice_override, language_code)
+
     try:
         return await _openai_tts(text, language_code)
     except Exception as e:

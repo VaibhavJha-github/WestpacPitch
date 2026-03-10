@@ -4,7 +4,8 @@ import json
 import time
 import base64
 import uuid
-from datetime import datetime
+import importlib.util
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -17,6 +18,7 @@ from stt import transcribe_audio, detected_language_to_code
 from tts import synthesize_speech, stream_speech, get_voice_id
 from llm import generate_response, generate_summary, test_runpod_connection
 from sentiment import analyze_sentiment, aggregate_sentiment
+from session_flow import SessionFlow
 from tools import (
     get_customer_profile,
     get_customer_accounts,
@@ -41,6 +43,94 @@ from tools import (
 _warm_state = {"model_ready": False, "stt_ready": False, "tts_ready": False, "db_ready": False}
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    """Coerce DB values to float while handling NULL/invalid values safely."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_session_summary(call_session_ref) -> str:
+    """Read ai_summary_short from Supabase nested relation payload."""
+    if not call_session_ref:
+        return ""
+    if isinstance(call_session_ref, dict):
+        return call_session_ref.get("ai_summary_short", "") or ""
+    if isinstance(call_session_ref, list) and call_session_ref:
+        first = call_session_ref[0] if isinstance(call_session_ref[0], dict) else {}
+        return first.get("ai_summary_short", "") or ""
+    return ""
+
+
+def _clean_ai_summary(ai_note: str, fallback_summary: str) -> str:
+    """Normalize summary text for dashboard rendering.
+
+    Some rows can contain a raw JSON blob instead of plain text.
+    """
+    raw = (ai_note or "").strip()
+    if not raw:
+        return (fallback_summary or "").strip()
+
+    # Try direct JSON parsing first.
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return (parsed.get("short_summary") or parsed.get("long_summary") or fallback_summary or raw).strip()
+    except Exception:
+        pass
+
+    # Handle cases where JSON content is embedded in text.
+    if "short_summary" in raw and "{" in raw and "}" in raw:
+        try:
+            start = raw.index("{")
+            end = raw.rindex("}") + 1
+            parsed = json.loads(raw[start:end])
+            if isinstance(parsed, dict):
+                return (parsed.get("short_summary") or parsed.get("long_summary") or fallback_summary or raw).strip()
+        except Exception:
+            pass
+
+    cleaned = raw
+    lower = cleaned.lower()
+    for marker in [
+        "he has been booked",
+        "she has been booked",
+        "they have been booked",
+        "appointment booked",
+        "video call with",
+        "phone call with",
+    ]:
+        idx = lower.find(marker)
+        if idx > 0:
+            cleaned = cleaned[:idx].rstrip(" ,.-") + "."
+            break
+
+    cleaned = cleaned.replace('{ "short_summary": "', "").replace('" }', "").strip()
+    return cleaned
+
+
+def _normalize_seed_display_date(row: dict, display_date: str) -> str:
+    """Push old seeded demo appointments into the future so live calls stand out."""
+    if row.get("session_id"):
+        return display_date
+    try:
+        parsed = datetime.fromisoformat(display_date)
+    except Exception:
+        return display_date
+    today = datetime.now(timezone.utc).date()
+    if parsed.date() >= today:
+        return display_date
+
+    # Deterministic per appointment id so ordering is stable across refreshes.
+    appt_id = str(row.get("id", ""))
+    offset = (sum(ord(ch) for ch in appt_id) % 21)
+    future_date = today + timedelta(days=120 + offset)
+    return future_date.isoformat()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -58,8 +148,27 @@ app.add_middleware(
 
 
 # ============================================================
-# Health & Warmup
+# Root & Health
 # ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Westpac AI Voice Agent Backend",
+        "status": "running",
+        "endpoints": {
+            "health": "/api/health",
+            "warmup": "/api/warmup (POST)",
+            "appointments": "/api/appointments",
+            "dashboard": "http://localhost:5173"
+        }
+    }
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return {"message": "No favicon"}
+
 
 @app.get("/api/health")
 async def health():
@@ -67,7 +176,7 @@ async def health():
         "status": "ok",
         "warm": _warm_state,
         "model": config.CLAUDE_MODEL if config.ANTHROPIC_API_KEY else config.VLLM_MODEL,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -84,9 +193,19 @@ async def warmup():
     except Exception as e:
         results["db"] = str(e)
 
-    # Test STT (just verify key exists)
-    _warm_state["stt_ready"] = bool(config.OPENAI_API_KEY)
-    results["stt"] = "ok" if _warm_state["stt_ready"] else "no key"
+    # Test STT readiness and provider path visibility
+    groq_module_present = importlib.util.find_spec("groq") is not None
+    has_groq_key = bool(config.GROQ_API_KEY)
+    has_openai_key = bool(config.OPENAI_API_KEY)
+    _warm_state["stt_ready"] = has_openai_key or (has_groq_key and groq_module_present)
+    if has_groq_key and groq_module_present:
+        results["stt"] = "ok (groq primary, openai fallback)"
+    elif has_groq_key and not groq_module_present and has_openai_key:
+        results["stt"] = "ok (openai fallback only; groq package missing in runtime env)"
+    elif has_openai_key:
+        results["stt"] = "ok (openai only)"
+    else:
+        results["stt"] = "no key"
 
     # Test TTS (just verify key exists)
     _warm_state["tts_ready"] = bool(config.ELEVENLABS_API_KEY)
@@ -138,7 +257,10 @@ async def list_appointments():
 
         collected_data = row.get("collected_data_json", [])
         if isinstance(collected_data, str):
-            collected_data = json.loads(collected_data)
+            try:
+                collected_data = json.loads(collected_data)
+            except Exception:
+                collected_data = []
 
         # Get slot time for the appointment
         slot_time = None
@@ -155,20 +277,36 @@ async def list_appointments():
                         slot_date = dt.strftime("%Y-%m-%d")
                     break
 
+        summary_short = _extract_session_summary(row.get("call_sessions"))
+        ai_note = _clean_ai_summary(row.get("ai_note", ""), summary_short)
+        sentiment_label = row.get("sentiment") or row.get("sentiment_label") or "Neutral"
+        sentiment_score = _safe_float(row.get("sentiment_score"), 50.0)
+        if sentiment_score <= 0:
+            sentiment_score = {
+                "Positive": 85.0,
+                "Neutral": 55.0,
+                "Anxious": 35.0,
+                "Frustrated": 20.0,
+            }.get(sentiment_label, 50.0)
+
+        display_time = slot_time or datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%H:%M")
+        display_date = slot_date or datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%Y-%m-%d")
+        display_date = _normalize_seed_display_date(row, display_date)
+
         appointments.append({
             "id": row["id"],
             "customerName": row.get("customer_name", ""),
             "customerInitials": row.get("customer_initials", ""),
             "companyName": row.get("company_name"),
-            "time": slot_time or datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%H:%M"),
-            "date": slot_date or datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%Y-%m-%d"),
+            "time": display_time,
+            "date": display_date,
             "type": row.get("appointment_type", ""),
-            "locationType": row.get("location_type", "Phone"),
-            "sentiment": row.get("sentiment", "Neutral"),
-            "sentimentScore": float(row.get("sentiment_score", 50)),
-            "sentimentNote": row.get("sentiment_note"),
+            "locationType": "Video chat" if row.get("location_type", "Phone") == "Video Chat" else row.get("location_type", "Phone"),
+            "sentiment": sentiment_label,
+            "sentimentScore": sentiment_score,
+            "sentimentNote": row.get("sentiment_note") or row.get("emotion_summary"),
             "intent": row.get("intent", ""),
-            "aiNote": row.get("ai_note", ""),
+            "aiNote": ai_note,
             "status": row.get("status", "Upcoming"),
             "customerTenure": row.get("customer_tenure"),
             "age": row.get("age"),
@@ -179,7 +317,7 @@ async def list_appointments():
             "currentLender": row.get("current_lender"),
             "reasonForLeaving": row.get("reason_for_leaving"),
             "selfDeclaredLVR": row.get("self_declared_lvr"),
-            "collectedData": collected_data,
+            "collectedData": collected_data if isinstance(collected_data, list) else [],
             "recommendedStrategy": {
                 "title": row.get("recommended_strategy_title", ""),
                 "description": row.get("recommended_strategy_description", ""),
@@ -262,7 +400,7 @@ async def list_clients():
                 "totalBankingValue": row.get("total_banking_value"),
                 "totalAppointments": row.get("total_appointments", 0),
                 "lastContactDate": row.get("last_contact_date", ""),
-                "averageSentiment": float(row.get("average_sentiment", 50) or 50),
+                "averageSentiment": _safe_float(row.get("average_sentiment"), 50.0),
             })
         return clients
     except Exception:
@@ -290,7 +428,7 @@ async def list_clients():
 @app.get("/api/analytics")
 async def get_analytics():
     sb = get_supabase()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     res = sb.table("analytics_snapshots").select("*").eq("snapshot_date", today).execute()
 
     if res.data:
@@ -324,13 +462,13 @@ async def get_analytics():
             "avgCallDuration": f"{snap.get('avg_call_duration_secs', 0) // 60}m {snap.get('avg_call_duration_secs', 0) % 60}s",
             "avgTTFA": f"{snap.get('avg_ttfa_ms', 0)}ms",
             "escalationCount": snap.get("escalation_count", 0),
-            "conversionRate": float(snap.get("conversion_rate", 0)),
+            "conversionRate": _safe_float(snap.get("conversion_rate"), 0.0),
         },
         "sentiment": {
-            "positive": float(snap.get("sentiment_positive_pct", 0)),
-            "neutral": float(snap.get("sentiment_neutral_pct", 0)),
-            "anxious": float(snap.get("sentiment_anxious_pct", 0)),
-            "frustrated": float(snap.get("sentiment_frustrated_pct", 0)),
+            "positive": _safe_float(snap.get("sentiment_positive_pct"), 0.0),
+            "neutral": _safe_float(snap.get("sentiment_neutral_pct"), 0.0),
+            "anxious": _safe_float(snap.get("sentiment_anxious_pct"), 0.0),
+            "frustrated": _safe_float(snap.get("sentiment_frustrated_pct"), 0.0),
         },
         "topIntents": top_intents,
         "modelVersion": snap.get("model_version", config.VLLM_MODEL),
@@ -351,39 +489,17 @@ async def get_banker_slots(date: str | None = None):
 async def live_session(ws: WebSocket):
     await ws.accept()
 
-    session_id = str(uuid.uuid4())
-    customer_id = "c0000001-0000-0000-0000-000000000001"  # Default demo customer
-    turn_index = 0
-    messages = []
-    all_turns = []
+    flow = SessionFlow()
     voice_override = None
     language_mode = "auto"
-    detected_lang = "en"
 
-    # Create session in DB
-    save_call_session({
-        "id": session_id,
-        "customer_id": customer_id,
-        "session_status": "active",
-    })
+    started = await flow.start()
 
     await ws.send_json({
         "type": "session_started",
-        "session_id": session_id,
-        "customer_id": customer_id,
+        "session_id": started["session_id"],
+        "customer_id": started["customer_id"],
     })
-
-    # Load customer context
-    profile = get_customer_profile(customer_id)
-    accounts = get_customer_accounts(customer_id)
-    context_parts = []
-    if profile:
-        context_parts.append(f"Customer: {profile['full_name']}, Age: {profile.get('age')}, Location: {profile.get('location')}, Profession: {profile.get('profession')}, Tenure: {profile.get('tenure_label')}")
-    if accounts:
-        acct_summary = ", ".join(f"{a['nickname']}: ${a['balance']}" for a in accounts)
-        context_parts.append(f"Accounts: {acct_summary}")
-
-    context = "\n".join(context_parts)
 
     tts_task = None
 
@@ -406,12 +522,7 @@ async def live_session(ws: WebSocket):
         tts_task = None  # No-op now, TTS runs inline
 
     try:
-        # AI greets first
-        customer_name = profile["full_name"].split()[0] if profile else "mate"
-        greeting = f"G'day {customer_name}, thanks for calling Westpac! I'm Alex, your AI assistant. How can I help you today?"
-        messages.append({"role": "assistant", "content": greeting})
-        all_turns.append({"speaker": "bot", "text": greeting, "lang": "en"})
-
+        greeting = started["greeting"]
         await ws.send_json({"type": "response_text", "text": greeting})
         await do_tts_stream(greeting, "en", voice_override)
 
@@ -439,21 +550,9 @@ async def live_session(ws: WebSocket):
                 # STT
                 stt_start = time.time()
                 audio_fmt = data.get("format", "webm")
-                stt_result = transcribe_audio(audio_bytes, filename=f"audio.{audio_fmt}")
-                stt_latency = stt_result["latency_ms"]
-
-                customer_text = stt_result["text"].strip()
-                print(f"[STT] {stt_latency}ms: '{customer_text}'")
-                if not customer_text:
+                turn_result = await flow.process_audio(audio_bytes, filename=f"audio.{audio_fmt}")
+                if not turn_result:
                     continue
-
-                # Skip single-word transcriptions (almost always hallucinations from noise)
-                if len(customer_text.split()) < 2:
-                    print(f"[STT] Skipping single word: {customer_text}")
-                    continue
-
-                turn_index += 1
-                all_turns.append({"speaker": "customer", "text": customer_text, "lang": "en", "stt_ms": stt_latency})
 
                 await ws.send_json({
                     "type": "thinking",
@@ -462,124 +561,22 @@ async def live_session(ws: WebSocket):
                 await ws.send_json({
                     "type": "transcript",
                     "speaker": "customer",
-                    "text": customer_text,
-                    "language": "en",
-                    "stt_latency_ms": stt_latency,
-                    "turn_index": turn_index,
+                    "text": turn_result["customer_text"],
+                    "language": turn_result["language"],
+                    "stt_latency_ms": turn_result["stt_latency_ms"],
+                    "turn_index": turn_result["turn_index"] - 1,
                 })
-
-                messages.append({"role": "user", "content": customer_text})
-
-                extra_context = context
-                for kw in ["rate", "loan", "product", "home loan", "fixed", "variable", "first home", "fraud", "scam", "lost card"]:
-                    if kw in customer_text.lower():
-                        knowledge = search_knowledge_pack(kw)
-                        if knowledge:
-                            extra_context += "\n\nRelevant Knowledge:\n" + "\n---\n".join(
-                                f"{k['title']}: {k['content'][:500]}" for k in knowledge
-                            )
-                        break
-
-                for kw in ["spend", "saving", "budget", "afford", "money", "car", "goal", "coffee", "eating out"]:
-                    if kw in customer_text.lower():
-                        spending = get_spending_summary(customer_id)
-                        if spending:
-                            extra_context += "\n\nSpending Summary:\n" + "\n".join(
-                                f"- {s['category']}: ${s['total_amount']} ({s['transaction_count']} txns, avg ${s['avg_amount']})"
-                                for s in spending
-                            )
-                        break
-
-                # Keep only last 10 messages to avoid token overflow
-                trimmed_messages = messages[-10:] if len(messages) > 10 else messages
-
-                try:
-                    llm_result = await generate_response(trimmed_messages, context=extra_context)
-                except Exception as e:
-                    print(f"[LLM ERROR] {e}")
-                    llm_result = {"text": "Sorry, could you say that again mate?", "latency_ms": 0, "provider": "fallback"}
-
-                llm_latency = llm_result["latency_ms"]
-                bot_text = llm_result["text"]
-                print(f"[LLM] {llm_result.get('provider', '?')} {llm_latency}ms: {bot_text[:80]}")
-
-                if llm_result.get("tool_call"):
-                    tc = llm_result["tool_call"]
-                    tool_name = tc.get("tool", "")
-                    tool_args = tc.get("args", {})
-
-                    if tool_name == "get_available_banker_slots":
-                        tool_result = get_available_banker_slots(tool_args.get("date"))
-                        if tool_result:
-                            slots_text = "\n".join(f"- {s['slot_label']} ({s['status']})" for s in tool_result[:5])
-                            messages.append({"role": "assistant", "content": bot_text or "Let me check available slots."})
-                            messages.append({"role": "user", "content": f"[Tool result - available slots:\n{slots_text}]\nNow offer the customer 2 suitable slots from this list."})
-                            followup = await generate_response(messages, context=extra_context)
-                            bot_text = followup["text"]
-                            llm_latency += followup["latency_ms"]
-
-                    elif tool_name == "search_knowledge_pack":
-                        tool_result = search_knowledge_pack(tool_args.get("query", ""))
-                        if tool_result:
-                            knowledge_text = "\n---\n".join(f"{k['title']}: {k['content'][:400]}" for k in tool_result)
-                            messages.append({"role": "assistant", "content": bot_text or "Let me look that up."})
-                            messages.append({"role": "user", "content": f"[Knowledge result:\n{knowledge_text}]\nAnswer the customer's question using this information."})
-                            followup = await generate_response(messages, context=extra_context)
-                            bot_text = followup["text"]
-                            llm_latency += followup["latency_ms"]
-
-                    elif tool_name == "create_appointment_offer":
-                        apt = create_appointment_from_call(
-                            session_id=session_id,
-                            customer_id=customer_id,
-                            intent=tool_args.get("intent", "Home Loan Enquiry"),
-                            location_type=tool_args.get("location_type", "Phone"),
-                            ai_note=tool_args.get("ai_note", ""),
-                            collected_data=tool_args.get("collected_data"),
-                            primary_slot_id=tool_args.get("primary_slot_id"),
-                            fallback_slot_id=tool_args.get("fallback_slot_id"),
-                        )
-                        if apt:
-                            await ws.send_json({"type": "booking_created", "appointment": apt})
-
-                    elif tool_name == "send_followup_sms":
-                        sms_body = tool_args.get("message", "")
-                        if sms_body and config.CUSTOMER_PHONE_NUMBER:
-                            send_sms(config.CUSTOMER_PHONE_NUMBER, sms_body)
-
-                    elif tool_name == "route_to_team":
-                        team = route_to_team(tool_args.get("intent", ""), tool_args.get("emotion"))
-                        update_call_session(session_id, {"routed_team": team})
-
-                    elif tool_name == "get_spending_summary":
-                        tool_result = get_spending_summary(tool_args.get("customer_id", customer_id))
-                        if tool_result:
-                            spending_text = "\n".join(f"- {s['category']}: ${s['total_amount']} ({s['transaction_count']} txns)" for s in tool_result)
-                            messages.append({"role": "assistant", "content": bot_text or "Let me review your spending."})
-                            messages.append({"role": "user", "content": f"[Spending data:\n{spending_text}]\nProvide helpful spending insights to the customer."})
-                            followup = await generate_response(messages, context=extra_context)
-                            bot_text = followup["text"]
-                            llm_latency += followup["latency_ms"]
-
-                if not bot_text:
-                    bot_text = "I understand. How can I help you further?"
-
-                messages.append({"role": "assistant", "content": bot_text})
-
-                voice_lang = "en"
-                turn_index += 1
 
                 await ws.send_json({
                     "type": "response_text",
-                    "text": bot_text,
-                    "llm_latency_ms": llm_latency,
-                    "stt_latency_ms": stt_latency,
-                    "turn_index": turn_index,
+                    "text": turn_result["bot_text"],
+                    "llm_latency_ms": turn_result["llm_latency_ms"],
+                    "stt_latency_ms": turn_result["stt_latency_ms"],
+                    "turn_index": turn_result["turn_index"],
                 })
 
                 # Stream TTS inline (more reliable than background task)
-                await do_tts_stream(bot_text, voice_lang, voice_override)
-                all_turns.append({"speaker": "bot", "text": bot_text, "lang": voice_lang, "llm_ms": llm_latency})
+                await do_tts_stream(turn_result["bot_text"], turn_result["language"], voice_override)
 
               except Exception as e:
                 print(f"[TURN ERROR] {e}", flush=True)
@@ -610,59 +607,18 @@ async def live_session(ws: WebSocket):
         except Exception:
             pass
     finally:
-        # Post-call: save turns, run sentiment, generate summary
         try:
-            if all_turns:
-                print(f"[POST-CALL] Processing {len(all_turns)} turns...")
-
-                # Save all turns to DB now
-                for i, turn in enumerate(all_turns):
-                    save_call_turn({
-                        "session_id": session_id,
-                        "speaker": turn["speaker"],
-                        "text": turn["text"],
-                        "timestamp_label": datetime.utcnow().strftime("%H:%M"),
-                        "language_code": turn.get("lang", "en"),
-                        "turn_index": i + 1,
-                        "stt_latency_ms": turn.get("stt_ms"),
-                        "llm_latency_ms": turn.get("llm_ms"),
-                        "tts_latency_ms": turn.get("tts_ms"),
-                    })
-
-                # Run sentiment on customer turns
-                customer_texts = [t["text"] for t in all_turns if t["speaker"] == "customer"]
-                agg = aggregate_sentiment(
-                    [{"speaker": "customer", "text": t} for t in customer_texts]
-                )
-
-                # Generate summary with Claude (quality matters here, not speed)
-                summary = await generate_summary(all_turns)
-
-                update_call_session(session_id, {
-                    "session_status": "completed",
-                    "ended_at": datetime.utcnow().isoformat(),
-                    "sentiment_label": agg["label"],
-                    "sentiment_score": agg["score"],
-                    "emotion_summary": agg["emotion"],
-                    "primary_intent": summary.get("primary_intent", ""),
-                    "routed_team": summary.get("routed_team", ""),
-                    "ai_summary_short": summary.get("short_summary", ""),
-                    "ai_summary_long": summary.get("long_summary", ""),
-                    "recommended_strategy_title": summary.get("recommended_strategy_title", ""),
-                    "recommended_strategy_description": summary.get("recommended_strategy_description", ""),
-                })
-
-                print(f"[POST-CALL] Done. Sentiment: {agg['label']}, Intent: {summary.get('primary_intent')}")
-
+            finalized = await flow.finalize()
+            if finalized:
                 try:
                     await ws.send_json({
                         "type": "session_ended",
-                        "session_id": session_id,
-                        "summary": summary,
-                        "sentiment": agg,
+                        "session_id": finalized["session_id"],
+                        "summary": finalized["summary"],
+                        "sentiment": finalized["sentiment"],
                     })
                 except Exception:
-                    pass  # WS might be closed already
+                    pass
         except Exception as e:
             print(f"[POST-CALL ERROR] {e}")
 
@@ -693,6 +649,11 @@ async def twilio_voice(request: Request):
     """Twilio calls this when someone dials your number."""
     host = request.headers.get("host", "localhost")
     scheme = "wss" if request.url.scheme == "https" else "ws"
+    ws_url = f"{scheme}://{host}/api/twilio/stream"
+    print(f"[Twilio Voice] Incoming POST to /api/twilio/voice")
+    print(f"[Twilio Voice] Host header: {host}")
+    print(f"[Twilio Voice] Scheme: {scheme}")
+    print(f"[Twilio Voice] WebSocket URL: {ws_url}")
     return voice_webhook_handler(host, scheme)
 
 

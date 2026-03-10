@@ -31,6 +31,7 @@ from tools import (
     update_call_session,
     save_call_turn,
     update_analytics,
+    create_appointment_from_call,
 )
 
 # Track warm state
@@ -470,6 +471,7 @@ async def live_session(ws: WebSocket):
                     tc = llm_result["tool_call"]
                     tool_name = tc.get("tool", "")
                     tool_args = tc.get("args", {})
+                    print(f"[TOOL] {tool_name} args={tool_args}")
 
                     if tool_name == "get_available_banker_slots":
                         tool_result = get_available_banker_slots(tool_args.get("date"))
@@ -490,6 +492,20 @@ async def live_session(ws: WebSocket):
                             followup = await generate_response(messages, context=extra_context)
                             bot_text = followup["text"]
                             llm_latency += followup["latency_ms"]
+
+                    elif tool_name == "create_appointment_offer":
+                        apt = create_appointment_from_call(
+                            session_id=session_id,
+                            customer_id=customer_id,
+                            intent=tool_args.get("intent", "Home Loan Enquiry"),
+                            location_type=tool_args.get("location_type", "Phone"),
+                            ai_note=tool_args.get("ai_note", ""),
+                            collected_data=tool_args.get("collected_data"),
+                            primary_slot_id=tool_args.get("primary_slot_id"),
+                            fallback_slot_id=tool_args.get("fallback_slot_id"),
+                        )
+                        if apt and apt.get("id"):
+                            await ws.send_json({"type": "booking_created", "appointment": apt})
 
                     elif tool_name == "route_to_team":
                         team = route_to_team(tool_args.get("intent", ""), tool_args.get("emotion"))

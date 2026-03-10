@@ -1,6 +1,7 @@
 """LLM — Groq (fastest) → GPT-4o-mini (fallback) | Claude (post-call summary)."""
 import time
 import json
+import re
 import httpx
 from config import (
     ANTHROPIC_API_KEY, CLAUDE_MODEL,
@@ -79,7 +80,15 @@ def _parse_summary(text: str) -> dict:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
             text = text.split("```")[1].split("```")[0]
-        return json.loads(text.strip())
+        cleaned = text.strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(cleaned[start:end + 1])
+            raise
     except (json.JSONDecodeError, IndexError):
         return {
             "short_summary": text[:200],
@@ -214,25 +223,21 @@ async def _call_runpod_vllm(
 def _parse_response(text: str, latency_ms: int, provider: str = "unknown") -> dict:
     tool_call = None
 
-    if '{"tool"' in text:
+    # Extract tool calls even when wrapped in code fences, pretty-printed,
+    # or emitted with whitespace before "tool".
+    cleaned = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).replace("```", "")
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(cleaned):
+        if ch != "{":
+            continue
         try:
-            start_idx = text.index('{"tool"')
-            brace_count = 0
-            end_idx = start_idx
-            for i in range(start_idx, len(text)):
-                if text[i] == '{':
-                    brace_count += 1
-                elif text[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end_idx = i + 1
-                        break
-
-            json_str = text[start_idx:end_idx]
-            tool_call = json.loads(json_str)
-            text = (text[:start_idx] + text[end_idx:]).strip()
-        except (ValueError, json.JSONDecodeError):
-            pass
+            obj, consumed = decoder.raw_decode(cleaned[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "tool" in obj:
+            tool_call = obj
+            text = (cleaned[:idx] + cleaned[idx + consumed:]).strip()
+            break
 
     return {
         "text": text,

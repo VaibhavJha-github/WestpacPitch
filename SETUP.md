@@ -1,456 +1,689 @@
-# Westpac AI Voice Agent — Full Setup Guide
+# Westpac AI Voice Agent Setup Guide
 
-This guide gets you from a fresh clone to a fully working demo:
-- AI answers phone calls via Twilio
-- Handles 2 demo scenarios (Budget Planning + Book a Banker)
-- Saves transcripts, summaries, and bookings to Supabase
-- Dashboard shows everything live (appointments, transcripts, calendar)
-- Banker accepts booking → customer gets SMS confirmation + cross-sell
+This repository currently contains a working end-to-end demo for:
+
+- Browser-based live AI voice conversations from the dashboard
+- Twilio phone-call intake with booking creation
+- Supabase-backed appointments, transcripts, summaries, analytics, and client views
+- Banker acceptance flow with Twilio SMS confirmation and cross-sell messaging
+
+This guide reflects the current codebase as it exists now.
+
+---
+
+## What The System Currently Does
+
+### Core flows
+
+- Dashboard live call page opens a browser WebSocket to the backend and runs a full AI voice session.
+- Twilio voice webhook answers a phone call, opens a Twilio Media Stream, transcribes speech, generates responses, and can create an appointment.
+- Completed calls are summarized and written into Supabase as:
+  - call sessions
+  - call turns
+  - appointments
+  - client-facing banker briefing data
+- A banker can accept an appointment from the dashboard and trigger SMS confirmation.
+
+### Current backend capabilities
+
+- STT: Groq Whisper primary, OpenAI Whisper fallback
+- Live LLM responses: Groq primary, OpenAI fallback
+- Post-call summaries: Claude primary, Groq/OpenAI fallback
+- Browser live-call TTS: streamed PCM audio
+- Twilio call TTS: ElevenLabs voice output transcoded for Twilio telephony
+- Shared conversation engine: both dashboard live sessions and Twilio calls now use the same backend session flow for turn handling, booking logic, and post-call summarization
+
+### Current frontend capabilities
+
+- Appointment list, detail view, calendar, clients, analytics, and live call page
+- Backend-backed appointment fetching and polling
+- Appointment accept / decline actions
+- Cached appointment detail loading to reduce UI flicker
+
+---
+
+## Current Architecture
+
+### High-level services
+
+1. Dashboard frontend
+   - React + TypeScript + Vite
+   - Runs locally on port 5173 by default
+
+2. FastAPI backend
+   - Runs locally on port 8000
+   - Exposes REST endpoints and WebSocket endpoints
+
+3. Supabase
+   - Stores demo customers, banker slots, appointments, call sessions, call turns, analytics
+
+4. Twilio
+   - Voice webhook for incoming calls
+   - Media Streams for real-time audio
+   - SMS for booking confirmation
+
+5. Model providers
+   - Groq for fast STT and live LLM responses
+   - OpenAI fallback for STT / LLM and OpenAI TTS when needed
+   - Anthropic Claude for post-call summaries
+   - ElevenLabs for selected voices and Twilio-specific voice output
+
+### Request / audio flow
+
+#### Dashboard live call
+
+- Frontend page: `/live`
+- Frontend captures mic audio with browser VAD
+- Frontend sends completed utterances to `ws://localhost:8000/api/live/session`
+- Backend shared session engine processes the turn
+- Backend streams audio back to the browser
+
+#### Twilio phone call
+
+- Twilio sends `POST /api/twilio/voice`
+- Backend returns TwiML instructing Twilio to open `/api/twilio/stream`
+- Twilio streams 8kHz mulaw audio over WebSocket
+- Backend performs server-side VAD, hands utterances into the shared session engine, then sends audio back to Twilio in mulaw chunks
+
+#### Optional OpenAI Realtime path
+
+- `ws://localhost:8000/api/realtime/session`
+- Separate experimental / alternate voice path using OpenAI Realtime API
+
+---
+
+## Repository Layout
+
+```text
+backend/                 FastAPI app, Twilio flow, session engine, STT/LLM/TTS
+dashboard/               React dashboard
+docs/                    PRDs and reference docs
+supabase_schema_and_seed.sql
+SETUP.md
+RUNPOD_SETUP.md
+```
+
+Important backend files:
+
+- `backend/main.py`: FastAPI app, REST routes, dashboard live-session route, Twilio routes
+- `backend/session_flow.py`: shared conversation / booking / summarization engine
+- `backend/twilio_handler.py`: Twilio-specific media transport and telephony playback
+- `backend/stt.py`: Groq/OpenAI transcription
+- `backend/llm.py`: live LLM and post-call summaries
+- `backend/tts.py`: OpenAI / ElevenLabs TTS
+- `backend/tools.py`: appointment creation, slot handling, SMS helpers, analytics updates
+- `backend/config.py`: environment variable loading from `.env` and `.env.local`
+
+Important frontend files:
+
+- `dashboard/src/pages/Live.tsx`: browser live-call UI
+- `dashboard/src/lib/api.ts`: frontend API client
+- `dashboard/src/lib/supabase.ts`: frontend backend/Supabase config
 
 ---
 
 ## Prerequisites
 
-You need these installed on your Mac Mini (or whatever machine runs the backend):
+Install these before setup:
 
-- **Python 3.11+** — `python3 --version`
-- **Node.js 18+** — `node --version`
-- **npm** — `npm --version`
-- **ffmpeg** — needed for audio conversion (Twilio uses mulaw format)
-- **git** — `git --version`
+- Python 3.11+
+- Node.js 18+
+- npm 9+
+- Git
+- ffmpeg
+- ngrok
 
-### Install ffmpeg if you don't have it:
+### Windows install notes
+
+#### Python
+
+- Install from Python.org or use `winget install Python.Python.3.11`
+
+#### Node.js
+
+- Install from Node.js LTS or use `winget install OpenJS.NodeJS.LTS`
+
+#### ffmpeg
+
+One option:
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+If you install manually, make sure the ffmpeg binary is on your system PATH.
+
+#### ngrok
+
+One option:
+
+```powershell
+winget install Ngrok.Ngrok
+```
+
+Then authenticate it once:
+
+```powershell
+ngrok config add-authtoken <YOUR_NGROK_AUTHTOKEN>
+```
+
+### macOS install notes
+
+Using Homebrew is the simplest path:
+
+#### Homebrew
+
+If you do not already have Homebrew:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+#### Python
+
+```bash
+brew install python@3.11
+```
+
+#### Node.js
+
+```bash
+brew install node@20
+```
+
+#### ffmpeg
+
 ```bash
 brew install ffmpeg
 ```
 
-### Verify Python:
+#### ngrok
+
+```bash
+brew install ngrok/ngrok/ngrok
+```
+
+Then authenticate it once:
+
+```bash
+ngrok config add-authtoken <YOUR_NGROK_AUTHTOKEN>
+```
+
+### Quick verification
+
+Windows:
+
+```powershell
+python --version
+node --version
+npm --version
+ffmpeg -version
+ngrok version
+```
+
+macOS:
+
 ```bash
 python3 --version
-# Should be 3.11 or higher
+node --version
+npm --version
+ffmpeg -version
+ngrok version
 ```
 
 ---
 
-## Step 1: Clone the Repo
+## Backend Setup
 
-```bash
-cd ~/Documents
-git clone https://github.com/VaibhavJha-github/WestpacPitch.git
-cd WestpacPitch
-```
+From the repo root:
 
----
+Windows:
 
-## Step 2: Set Up the Backend
-
-### 2a. Create a Python virtual environment
-```bash
+```powershell
 cd backend
-python3 -m venv venv
-source venv/bin/activate
-```
-
-You should see `(venv)` in your terminal prompt now.
-
-### 2b. Install Python dependencies
-```bash
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-This installs FastAPI, Twilio, OpenAI, Groq, Anthropic, Supabase, etc.
+macOS:
 
-### 2c. Create your `.env` file
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Python dependencies currently required
+
+These are installed from `backend/requirements.txt`:
+
+- fastapi
+- uvicorn[standard]
+- websockets
+- python-dotenv
+- supabase
+- openai
+- httpx
+- vaderSentiment
+- pydantic
+- numpy
+- anthropic
+- groq
+- twilio
+
+### Backend environment files
+
+The backend loads variables in this order:
+
+1. `backend/.env`
+2. `backend/.env.local` with override enabled
+
+Recommended approach:
+
+Windows:
+
+```powershell
+copy .env.example .env
+copy .env.example .env.local
+```
+
+macOS:
 
 ```bash
 cp .env.example .env
+cp .env.example .env.local
 ```
 
-Now open `backend/.env` in any text editor and fill in your real keys:
+Then put machine-specific and demo-specific overrides in `.env.local`.
 
-```bash
-nano .env
-# or
-open -a TextEdit .env
-```
+### Required backend environment variables
 
-Fill in ALL of these (you already have most of them):
+Minimum recommended set for the current architecture:
 
-```
-# Supabase (already set up)
-SUPABASE_URL=https://hpqldmexivtoaphymwva.supabase.co
-SUPABASE_ANON_KEY=<your-anon-key>
-SUPABASE_SERVICE_KEY=<your-service-key>
+```env
+SUPABASE_URL=
+SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_KEY=
 
-# Groq
-GROQ_API_KEY=<your-groq-key>
+GROQ_API_KEY=
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+CLAUDE_MODEL=claude-sonnet-4-6-20250514
 
-# Anthropic
-ANTHROPIC_API_KEY=<your-anthropic-key>
-CLAUDE_MODEL=claude-sonnet-4-6
-
-# OpenAI
-OPENAI_API_KEY=<your-openai-key>
-
-# ElevenLabs
-ELEVENLABS_API_KEY=<your-elevenlabs-key>
+ELEVENLABS_API_KEY=
 USE_ELEVENLABS=1
-DEFAULT_VOICE_ID=EXAVITQu4vr4xnSDxMaL
 
-# Voice IDs
-VOICE_ID_INDIAN_EN=EXAVITQu4vr4xnSDxMaL
-VOICE_ID_AUSTRALIAN_EN=IKne3meq5aSn9XLyUdCD
+VOICE_ID_INDIAN_EN=omLr0bN17lYIC1JWLSYV
+VOICE_ID_AUSTRALIAN_EN=snyKKuaGYk1VUEh42zbW
+DEFAULT_VOICE_ID=omLr0bN17lYIC1JWLSYV
 
-# Twilio (fill these in Step 5)
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
 TWILIO_PHONE_NUMBER=
 CUSTOMER_PHONE_NUMBER=
+
+RUNPOD_API_KEY=
+RUNPOD_ENDPOINT_ID=
+VLLM_BASE_URL=
+VLLM_MODEL=Qwen/Qwen2.5-14B-Instruct-AWQ
 ```
 
-### 2d. Test the backend starts
+### Start the backend
 
-```bash
+Windows:
+
+```powershell
+cd backend
+.\.venv\Scripts\Activate.ps1
 python main.py
 ```
 
-You should see:
-```
-INFO:     Uvicorn running on http://0.0.0.0:8000
-```
+macOS:
 
-Open a browser and go to: `http://localhost:8000/api/health`
-
-You should see JSON with `"status": "ok"`. If yes, the backend works. Press Ctrl+C to stop it for now.
-
----
-
-## Step 3: Set Up the Database (Supabase)
-
-**If you already ran the schema before, skip this step.**
-
-If starting fresh:
-
-1. Go to https://supabase.com/dashboard
-2. Open your project (hpqldmexivtoaphymwva)
-3. Go to **SQL Editor**
-4. Copy the entire contents of `supabase_schema_and_seed.sql` from the repo root
-5. Paste it in the SQL editor
-6. Click **Run**
-7. It should complete without errors
-
-This creates all tables, views, indexes, seed data (3 customers, 1 banker, transactions, etc.)
-
-### Verify:
-Go to **Table Editor** in Supabase and check:
-- `customer_profiles` — should have 3 rows
-- `bankers` — should have 1 row (Mia Sullivan)
-- `customer_transactions` — should have 58 rows
-- `banker_availability` — should have 10 rows
-
----
-
-## Step 4: Set Up the Dashboard
-
-### 4a. Install dependencies
 ```bash
-cd ../dashboard_src/dashboard
+cd backend
+source .venv/bin/activate
+python3 main.py
+```
+
+Backend default URL:
+
+- `http://localhost:8000`
+
+Useful checks:
+
+- `GET /api/health`
+- `POST /api/warmup`
+
+---
+
+## Database Setup
+
+If you are starting from an empty Supabase project:
+
+1. Create a Supabase project.
+2. Open the SQL editor.
+3. Run the contents of `supabase_schema_and_seed.sql`.
+
+This seeds demo customers, appointments, banker availability, transactions, and related tables/views used by the dashboard and voice flows.
+
+At minimum, verify these tables exist and contain data:
+
+- `customer_profiles`
+- `customer_accounts`
+- `customer_transactions`
+- `banker_availability`
+- `appointments`
+- `call_sessions`
+- `call_turns`
+- `analytics_snapshots`
+
+---
+
+## Dashboard Setup
+
+From the repo root:
+
+Windows:
+
+```powershell
+cd dashboard
 npm install
 ```
 
-### 4b. Create the dashboard `.env`
+macOS:
 
 ```bash
-cat > .env << 'EOF'
-VITE_SUPABASE_URL=https://hpqldmexivtoaphymwva.supabase.co
-VITE_SUPABASE_ANON_KEY=<your-supabase-anon-key>
+cd dashboard
+npm install
+```
+
+There is no checked-in dashboard env file. Create one:
+
+Windows:
+
+```powershell
+@"
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
+VITE_BACKEND_URL=http://localhost:8000
+"@ | Set-Content .env.local
+```
+
+macOS:
+
+```bash
+cat > .env.local <<'EOF'
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
 VITE_BACKEND_URL=http://localhost:8000
 EOF
 ```
 
-Replace `<your-supabase-anon-key>` with your actual anon key.
+### Frontend scripts
 
-### 4c. Test the dashboard locally
+Available scripts from `dashboard/package.json`:
 
-```bash
+- `npm run dev`
+- `npm run build`
+- `npm run lint`
+- `npm run preview`
+
+### Start the dashboard
+
+Windows:
+
+```powershell
+cd dashboard
 npm run dev
 ```
 
-Open `http://localhost:5173` in your browser. You should see the Westpac dashboard with existing appointments from the seed data.
+macOS:
+
+```bash
+cd dashboard
+npm run dev
+```
+
+Dashboard default URL:
+
+- `http://localhost:5173`
 
 ---
 
-## Step 5: Set Up Twilio
+## Twilio Setup
 
-### 5a. Create a Twilio account
-1. Go to https://www.twilio.com/try-twilio
-2. Sign up (free trial gives you $15 credit — enough for demos)
-3. Verify your phone number
+### What Twilio is currently used for
 
-### 5b. Get a Twilio phone number
-1. In Twilio Console → **Phone Numbers** → **Buy a Number**
-2. Search for an Australian number (+61) or US number (+1)
-3. Buy it (costs ~$1/month)
-4. Note the number (e.g., `+61412345678`)
+- Incoming voice calls
+- Real-time Twilio Media Streams
+- SMS confirmation after banker acceptance
 
-### 5c. Get your credentials
-1. Go to Twilio Console dashboard
-2. Copy your **Account SID** (starts with `AC`)
-3. Copy your **Auth Token**
+### Twilio prerequisites
 
-### 5d. Update your backend `.env`
+1. Create a Twilio account.
+2. Buy or provision a phone number.
+3. If using a trial account, verify the phone numbers you will call from / send SMS to.
 
-```bash
-cd ../../backend
-nano .env
+### Required Twilio backend config
+
+Set these in `backend/.env.local`:
+
+```env
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
+TWILIO_PHONE_NUMBER=+61...
+CUSTOMER_PHONE_NUMBER=+61...
 ```
 
-Add these lines:
-```
-TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TWILIO_PHONE_NUMBER=+61412345678
-CUSTOMER_PHONE_NUMBER=+614xxxxxxxx
-```
+### Expose the backend with ngrok
 
-`CUSTOMER_PHONE_NUMBER` = your personal phone number (the one you'll call FROM during the demo, and where SMS confirmations will be sent).
+Start your backend first, then in another terminal:
 
-**Important for Twilio trial accounts:** You can only send SMS to verified numbers. Go to Twilio Console → **Phone Numbers** → **Verified Caller IDs** and add your personal number.
-
----
-
-## Step 6: Expose Your Mac Mini to the Internet
-
-Twilio needs to reach your backend over the internet. You have two options:
-
-### Option A: ngrok (easiest, free)
-
-```bash
-# Install ngrok
-brew install ngrok
-
-# Sign up at https://ngrok.com and get your auth token
-ngrok config add-authtoken <your-ngrok-token>
-
-# Start the tunnel
+```powershell
 ngrok http 8000
 ```
 
-ngrok will show you a URL like:
-```
-Forwarding: https://abc123.ngrok-free.app -> http://localhost:8000
-```
+Copy the public HTTPS URL from ngrok, for example:
 
-Copy that `https://xxx.ngrok-free.app` URL. This is your **PUBLIC_URL**.
+- `https://your-tunnel.ngrok-free.app`
 
-**Note:** Free ngrok URLs change every time you restart. For a stable URL, upgrade to ngrok paid ($8/month) or use Cloudflare Tunnel.
+### Configure the Twilio voice webhook
 
-### Option B: Cloudflare Tunnel (free, stable URL)
+In the Twilio Console for your number:
 
-```bash
-# Install cloudflared
-brew install cloudflare/cloudflare/cloudflared
+- Voice webhook URL: `https://YOUR-NGROK-URL/api/twilio/voice`
+- Method: `POST`
 
-# Login (opens browser)
-cloudflared tunnel login
+Important:
 
-# Create a tunnel
-cloudflared tunnel create westpac-demo
+- Use the full `/api/twilio/voice` path.
+- If ngrok changes, update the Twilio webhook.
 
-# Run the tunnel
-cloudflared tunnel --url http://localhost:8000
-```
+### Twilio voice behavior in the current build
 
-This gives you a stable `https://xxx.trycloudflare.com` URL.
+- Twilio phone calls use the same shared session engine as the dashboard live session.
+- The current default Twilio voice is Oliver via ElevenLabs.
+- Twilio call playback still goes through telephony transcoding to 8kHz mulaw, so call audio quality and timing will differ from the browser live-call page.
 
 ---
 
-## Step 7: Connect Twilio to Your Backend
+## Current Backend Routes
 
-1. Go to Twilio Console → **Phone Numbers** → **Active Numbers**
-2. Click your number
-3. Under **Voice Configuration**:
-   - **A call comes in**: Webhook
-   - **URL**: `https://<YOUR_PUBLIC_URL>/api/twilio/voice`
-   - **HTTP Method**: POST
-4. Click **Save**
+### REST routes
 
-That's it. When someone calls your Twilio number, Twilio will hit your backend, which starts the AI conversation.
+- `GET /`
+- `GET /api/health`
+- `POST /api/warmup`
+- `GET /api/appointments`
+- `GET /api/appointments/{appointment_id}`
+- `POST /api/appointments/{appointment_id}/accept`
+- `POST /api/appointments/{appointment_id}/decline`
+- `GET /api/clients`
+- `GET /api/analytics`
+- `GET /api/banker-slots`
+
+### WebSocket routes
+
+- `WS /api/live/session`
+- `WS /api/realtime/session`
+- `WS /api/twilio/stream`
+
+### Twilio webhook route
+
+- `POST /api/twilio/voice`
 
 ---
 
-## Step 8: Run Everything
+## Recommended Local Run Order
 
-You need 3 terminals open:
+Open separate terminals.
 
-### Terminal 1: Backend
-```bash
-cd ~/Documents/WestpacPitch/backend
-source venv/bin/activate
+### Terminal 1: backend
+
+Windows:
+
+```powershell
+cd backend
+.\.venv\Scripts\Activate.ps1
 python main.py
 ```
 
-### Terminal 2: Tunnel
+macOS:
+
 ```bash
-ngrok http 8000
-# Copy the https URL and set it in Twilio (Step 7)
+cd backend
+source .venv/bin/activate
+python3 main.py
 ```
 
-### Terminal 3: Dashboard (for local testing)
-```bash
-cd ~/Documents/WestpacPitch/dashboard_src/dashboard
+### Terminal 2: dashboard
+
+Windows:
+
+```powershell
+cd dashboard
 npm run dev
 ```
 
----
+macOS:
 
-## Step 9: Test End-to-End
-
-### Test 1: Call your Twilio number
-1. From your personal phone, call the Twilio number
-2. You should hear: "G'day Rohan, thanks for calling Westpac! I'm Alex..."
-3. Say: "Hey, I'm looking to save up for a car, about 25 grand"
-4. The AI should walk you through your expenses (coffee, Uber Eats, etc.)
-5. Hang up when done
-
-### Test 2: Check the dashboard
-1. Open `http://localhost:5173` (or your Vercel URL)
-2. You should see the new appointment appear with status **"Pending"**
-3. Click into it — you'll see the full transcript and AI summary
-
-### Test 3: Accept the booking
-1. On the appointment detail page, click **"Accept Booking"**
-2. You should get a green banner: "Confirmation SMS sent..."
-3. Check your phone — you should receive:
-   - **SMS 1** (immediately): Booking confirmation with time/location
-   - **SMS 2** (10 seconds later): Home insurance cross-sell
-
-### Test 4: Home loan scenario
-1. Call again
-2. Say: "I'm looking to get a home loan"
-3. Answer the AI's questions (location, budget, deposit, fixed/variable)
-4. When it asks about booking, say "Friday" or any day
-5. Pick a time slot, say in-person or online
-6. Hang up and check the dashboard
-
----
-
-## Step 10: Deploy Dashboard to Your Domain
-
-### Option A: Vercel (recommended)
-
-1. Push to GitHub (already done)
-2. Go to https://vercel.com
-3. Click **New Project** → Import your GitHub repo
-4. Set the **Root Directory** to: `dashboard_src/dashboard`
-5. Set **Framework Preset**: Vite
-6. Add **Environment Variables**:
-   ```
-   VITE_SUPABASE_URL = https://hpqldmexivtoaphymwva.supabase.co
-   VITE_SUPABASE_ANON_KEY = <your-anon-key>
-   VITE_BACKEND_URL = https://<your-ngrok-or-cloudflare-url>
-   ```
-7. Click **Deploy**
-8. Once deployed, go to **Settings** → **Domains**
-9. Add your custom domain
-10. Update your domain's DNS (Vercel will tell you what to set)
-
-**Important:** Every time your ngrok URL changes, you need to update `VITE_BACKEND_URL` in Vercel and redeploy. That's why Cloudflare Tunnel with a stable URL is better for production.
-
-### Option B: Use a stable backend URL
-
-If you set up Cloudflare Tunnel with a custom subdomain (e.g., `api.yourdomain.com`), your Vercel env var stays the same forever:
+```bash
+cd dashboard
+npm run dev
 ```
-VITE_BACKEND_URL = https://api.yourdomain.com
+
+### Terminal 3: ngrok
+
+Windows or macOS:
+
+```powershell
+ngrok http 8000
 ```
 
 ---
 
-## Architecture Summary
+## Smoke Test Checklist
 
-```
-┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  Customer    │────>│   Twilio     │────>│  Mac Mini        │
-│  (Phone)     │<────│  (Voice+SMS) │<────│  (FastAPI:8000)  │
-└─────────────┘     └──────────────┘     │                   │
-                                          │  Groq (STT+LLM)  │
-                                          │  OpenAI (TTS)     │
-                                          │  Claude (Summary) │
-                                          └────────┬──────────┘
-                                                   │
-                                          ┌────────▼──────────┐
-                                          │   Supabase        │
-                                          │  (Database)       │
-                                          └────────┬──────────┘
-                                                   │
-                                          ┌────────▼──────────┐
-                                          │   Vercel          │
-                                          │  (Dashboard)      │
-                                          │  yourdomain.com   │
-                                          └───────────────────┘
-```
+### Backend
 
-### What happens during a call:
-1. Customer calls Twilio number
-2. Twilio hits `/api/twilio/voice` → returns TwiML to open Media Stream
-3. Twilio streams audio to `/api/twilio/stream` WebSocket
-4. Backend: audio → Groq Whisper (STT) → Groq LLM → OpenAI TTS → back to Twilio
-5. Each turn saved to `call_turns` table
-6. If booking requested → `appointments` table (status: Pending)
-7. Call ends → Claude generates summary → `call_sessions` updated
-8. Dashboard auto-refreshes and shows the new appointment
+1. Open `http://localhost:8000/api/health`
+2. Confirm the backend responds
+3. Call `POST /api/warmup` and confirm DB/STT/TTS/LLM readiness
 
-### What happens when banker accepts:
-1. Banker clicks "Accept" on dashboard
-2. Dashboard calls `POST /api/appointments/{id}/accept`
-3. Backend updates appointment status to "Upcoming"
-4. Backend sends confirmation SMS via Twilio
-5. 10 seconds later, sends cross-sell SMS
-6. Dashboard shows green "Confirmed" badge
+### Dashboard
+
+1. Open `http://localhost:5173`
+2. Verify appointments load
+3. Open `/live`
+4. Click warmup and then start a browser live call
+
+### Twilio
+
+1. Make sure ngrok is running
+2. Confirm Twilio number points to `/api/twilio/voice`
+3. Call the Twilio number
+4. Confirm the call can create an appointment
+5. Accept the appointment from the dashboard and confirm SMS behavior
 
 ---
 
-## Troubleshooting
+## Common Troubleshooting
 
-### "Connection refused" when calling Twilio number
-- Make sure `python main.py` is running
-- Make sure ngrok/cloudflare tunnel is running
-- Make sure the Twilio webhook URL matches your tunnel URL
+### ffmpeg not found
 
-### No audio / AI doesn't respond
-- Check terminal for errors
-- Make sure `ffmpeg` is installed: `ffmpeg -version`
-- Make sure your API keys are correct in `.env`
-- Test the warmup: `curl -X POST http://localhost:8000/api/warmup`
+Symptom:
 
-### SMS not received
-- Check Twilio trial: only verified numbers receive SMS
-- Check `CUSTOMER_PHONE_NUMBER` in `.env` (must include country code like +61)
-- Check Twilio Console → **Messaging** → **Logs** for errors
+- Twilio greeting or Twilio TTS playback fails
 
-### Dashboard shows no data
-- Make sure `VITE_BACKEND_URL` points to the right backend
-- Check browser console for errors
-- Make sure Supabase schema is seeded
+Fix:
 
-### Dashboard works locally but not on Vercel
-- Update `VITE_BACKEND_URL` in Vercel to your public tunnel URL (not localhost)
-- Redeploy after changing env vars
+- Install ffmpeg
+- Ensure it is on PATH
+- Fully restart the terminal or VS Code after updating PATH
+
+### Twilio webhook hit but no call audio
+
+Check:
+
+- ngrok is still running
+- webhook URL includes `/api/twilio/voice`
+- backend is reachable from ngrok
+
+### Twilio trial account cannot call or SMS properly
+
+Check:
+
+- your caller ID / target number is verified in Twilio
+- your Twilio number is active
+
+### Dashboard loads but shows stale or incomplete data
+
+Check:
+
+- backend is pointing to the intended Supabase project
+- `SUPABASE_SERVICE_KEY` is valid
+- seed SQL has been run
+
+### Auto-reload interrupts a live call
+
+If backend files change while a live WebSocket or Twilio call is active, Uvicorn reload can terminate the session. Avoid editing backend files during a call test.
 
 ---
 
-## Cost Estimates (for demo)
+## Current Limitations / Notes
 
-| Service | Cost |
-|---------|------|
-| Twilio number | ~$1/month |
-| Twilio voice | ~$0.02/min |
-| Twilio SMS | ~$0.05/msg |
-| Groq API | Free tier (generous) |
-| OpenAI TTS | ~$0.015/1K chars |
-| Claude (summaries) | ~$0.003/summary |
-| Supabase | Free tier |
-| Vercel | Free tier |
-| ngrok | Free (or $8/mo for stable URL) |
+- Twilio phone-call audio quality will not exactly match the browser live-call experience because Twilio uses narrowband telephony audio.
+- The optional RunPod config is still supported in config, but it is not the primary live-call response path in the current code.
+- The dashboard live call page and Twilio transport share the same session engine, but they still differ in how audio is captured and played back.
 
-A typical demo call costs less than $0.10.
+---
+
+## Quick Start Summary
+
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env
+copy .env.example .env.local
+python main.py
+```
+
+```powershell
+cd dashboard
+npm install
+@"
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
+VITE_BACKEND_URL=http://localhost:8000
+"@ | Set-Content .env.local
+npm run dev
+```
+
+```powershell
+ngrok http 8000
+```

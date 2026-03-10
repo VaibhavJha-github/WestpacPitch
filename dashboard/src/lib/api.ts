@@ -13,13 +13,29 @@ export async function fetchAppointment(id: string): Promise<Appointment> {
   return res.json();
 }
 
-export async function acceptSlot(appointmentId: string, slotId: string): Promise<void> {
+export interface AcceptSlotResponse {
+  status: string;
+  slot_id: string;
+  sms?: {
+    confirmation?: {
+      status?: string;
+      sid?: string;
+      reason?: string;
+      error?: string;
+    };
+    to?: string;
+    crosssell_body?: string;
+  };
+}
+
+export async function acceptSlot(appointmentId: string, slotId: string): Promise<AcceptSlotResponse> {
   const res = await fetch(`${BACKEND_URL}/api/appointments/${appointmentId}/accept`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ slot_id: slotId }),
   });
   if (!res.ok) throw new Error('Failed to accept slot');
+  return res.json();
 }
 
 export interface ClientData {
